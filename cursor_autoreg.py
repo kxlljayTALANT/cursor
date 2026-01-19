@@ -201,6 +201,9 @@ class HttpClient:
     def get(self, url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
         return self.request("GET", url, headers=headers)
 
+    def head(self, url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
+        return self.request("HEAD", url, headers=headers)
+
     def post(
         self, url: str, headers: Optional[Dict[str, str]] = None, data: Optional[bytes] = None
     ) -> Tuple[int, Dict[str, str], bytes]:
@@ -495,11 +498,17 @@ def main() -> int:
 
     client = HttpClient(args.user_agent, args.proxy, args.timeout)
     signup_url = urllib.parse.urljoin(args.base_url, args.signup_path)
-    eprint(f"[flow] GET {signup_url}")
-    status, headers, body = client.get(signup_url)
+    eprint(f"[flow] HEAD {signup_url}")
+    head_status, head_headers, _ = client.head(signup_url, headers={"Accept": "text/html,*/*"})
+    dump_response(args.dump_dir, "signup_head", head_status, head_headers, b"")
+    page_url = client.last_url or signup_url
+    if page_url != signup_url:
+        eprint(f"[flow] redirect detected: {page_url}")
+
+    eprint(f"[flow] GET {page_url}")
+    status, headers, body = client.get(page_url)
     dump_response(args.dump_dir, "signup_page_initial", status, headers, body)
     body_text = decode_body(body, headers)
-    page_url = client.last_url or signup_url
     page_origin = get_origin(page_url)
     if page_url != signup_url:
         eprint(f"[flow] landing page: {page_url}")
