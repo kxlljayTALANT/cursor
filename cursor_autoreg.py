@@ -67,6 +67,36 @@ DEFAULT_ENDPOINTS = [
     "/api/auth/signin/email",
 ]
 
+USER_MANAGEMENT_ENDPOINTS = [
+    "/user_management/authorize",
+    "/user_management/authorize/identify",
+    "/user_management/authorize/sign_up",
+    "/user_management/authorize/registration",
+    "/user_management/authorize/send_email",
+    "/user_management/authorize/send_code",
+    "/user_management/authorize/send-otp",
+    "/user_management/authorize/verify",
+    "/user_management/authorize/verify_email",
+    "/user_management/authorize/verification",
+    "/user_management/authorize/email",
+    "/user_management/authorize/passwordless",
+    "/user_management/authorize/continue",
+    "/user_management/authorize/complete",
+    "/user_management/authorization",
+    "/user_management/authorization_session",
+    "/user_management/authorization_sessions",
+    "/user_management/authorization_sessions/email",
+    "/user_management/authorization_sessions/send_code",
+    "/user_management/authorization_sessions/send-otp",
+    "/user_management/authorization_sessions/verify",
+    "/user_management/sign_up",
+    "/user_management/sign-up",
+    "/user_management/register",
+    "/user_management/send_email_verification",
+    "/user_management/verify_email",
+    "/user_management/email",
+]
+
 
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
@@ -832,7 +862,10 @@ def main() -> int:
         endpoints = [item.strip() for item in args.endpoints.split(",") if item.strip()]
     else:
         extracted = extract_api_candidates(body_text)
-        endpoints = extracted or DEFAULT_ENDPOINTS
+        if extracted:
+            endpoints = extracted
+        else:
+            endpoints = DEFAULT_ENDPOINTS + USER_MANAGEMENT_ENDPOINTS
     api_origin = page_origin
     js_endpoints = fetch_js_endpoints(
         client=client,
