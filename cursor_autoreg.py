@@ -52,6 +52,10 @@ JS_ENDPOINT_PATTERNS = [
     r'["\'](\/api\/auth\/[^"\']+)["\']',
     r'["\'](https:\/\/[^"\']+\/user_management\/[^"\']+)["\']',
     r'["\'](https:\/\/[^"\']+\/api\/auth\/[^"\']+)["\']',
+    r"(\/user_management\/[A-Za-z0-9_\-\/]+)",
+    r"(\/api\/auth\/[A-Za-z0-9_\-\/]+)",
+    r"(https:\/\/[A-Za-z0-9.\-]+\/user_management\/[A-Za-z0-9_\-\/]+)",
+    r"(https:\/\/[A-Za-z0-9.\-]+\/api\/auth\/[A-Za-z0-9_\-\/]+)",
 ]
 DEFAULT_ENDPOINTS = [
     "/api/auth/signup",
@@ -812,6 +816,7 @@ def main() -> int:
         limit=args.js_chunk_limit,
     )
     if js_endpoints:
+        eprint(f"[flow] extracted {len(js_endpoints)} endpoints from JS")
         endpoints = list(dict.fromkeys(js_endpoints + endpoints))
     endpoints = normalize_endpoints(api_origin, rank_endpoints(endpoints))
 
