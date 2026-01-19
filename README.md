@@ -49,6 +49,10 @@ via CapSolver and can solve Turnstile when present.
 
   `--dump-dir ./dumps --dump-capsolver-solution`
 
+- Dump Next.js JS chunks for inspection:
+
+  `--dump-dir ./dumps --dump-js`
+
 ## Notes
 
 - The script is best-effort and relies on current Cursor endpoints. If endpoints change,

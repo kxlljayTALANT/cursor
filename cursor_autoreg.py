@@ -553,6 +553,8 @@ def fetch_js_endpoints(
     page_origin: str,
     html: str,
     limit: int,
+    dump_js: bool,
+    dump_dir: Optional[str],
 ) -> List[str]:
     paths = extract_js_chunk_paths(html)
     if not paths:
@@ -567,6 +569,11 @@ def fetch_js_endpoints(
         if status >= 400:
             continue
         js_text = decode_body(body, headers)
+        if dump_js and dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", path.strip("/"))
+            with open(os.path.join(dump_dir, f"js_{safe_name}"), "w", encoding="utf-8") as handle:
+                handle.write(js_text)
         endpoints.extend(extract_js_endpoints(js_text))
     return list(dict.fromkeys(endpoints))
 
@@ -693,6 +700,11 @@ def main() -> int:
     )
     parser.add_argument("--endpoints", help="Comma-separated API endpoints to try.")
     parser.add_argument("--dump-dir", help="Write response dumps to this directory.")
+    parser.add_argument(
+        "--dump-js",
+        action="store_true",
+        help="Dump fetched JS chunks to dump dir.",
+    )
     parser.add_argument("--js-chunk-limit", type=int, default=6)
     parser.add_argument(
         "--dump-capsolver-solution",
@@ -817,6 +829,8 @@ def main() -> int:
         page_origin=page_origin,
         html=body_text,
         limit=args.js_chunk_limit,
+        dump_js=args.dump_js,
+        dump_dir=args.dump_dir,
     )
     if js_endpoints:
         eprint(f"[flow] extracted {len(js_endpoints)} endpoints from JS")
