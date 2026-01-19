@@ -369,6 +369,12 @@ def apply_solution_cookies(
                 path = "/"
             set_cookie(client.cookie_jar, domain, name, value, path=path, secure=secure)
             applied.append((name, domain))
+    elif isinstance(cookies_list, dict):
+        for name, value in cookies_list.items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            set_cookie(client.cookie_jar, default_domain, name, value, path="/")
+            applied.append((name, default_domain))
 
     cookie_blob = solution.get("cookie")
     if isinstance(cookie_blob, str):
