@@ -241,6 +241,11 @@ def extract_cookie_value(cookie_header: str, name: str) -> Optional[str]:
     return None
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class HttpClient:
     def __init__(self, user_agent: str, proxy: Optional[str], timeout: int) -> None:
         self.user_agent = user_agent
@@ -252,9 +257,17 @@ class HttpClient:
         if proxy:
             handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         self.opener = urllib.request.build_opener(*handlers)
+        self.opener_no_redirect = urllib.request.build_opener(
+            *handlers, NoRedirectHandler()
+        )
 
     def request(
-        self, method: str, url: str, headers: Optional[Dict[str, str]] = None, data: Optional[bytes] = None
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        allow_redirects: bool = True,
     ) -> Tuple[int, Dict[str, str], bytes]:
         request_headers = {
             "User-Agent": self.user_agent,
@@ -264,7 +277,8 @@ class HttpClient:
             request_headers.update(headers)
         req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try:
-            with self.opener.open(req, timeout=self.timeout) as resp:
+            opener = self.opener if allow_redirects else self.opener_no_redirect
+            with opener.open(req, timeout=self.timeout) as resp:
                 self.last_url = resp.geturl()
                 body = resp.read()
                 return resp.status, dict(resp.headers), body
@@ -276,11 +290,15 @@ class HttpClient:
             self.last_url = None
             raise RuntimeError(f"Request failed: {exc}") from exc
 
-    def get(self, url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
-        return self.request("GET", url, headers=headers)
+    def get(
+        self, url: str, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = True
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        return self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
 
-    def head(self, url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
-        return self.request("HEAD", url, headers=headers)
+    def head(
+        self, url: str, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = True
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        return self.request("HEAD", url, headers=headers, allow_redirects=allow_redirects)
 
     def post(
         self, url: str, headers: Optional[Dict[str, str]] = None, data: Optional[bytes] = None
@@ -546,6 +564,16 @@ def build_context_fields(page_url: str) -> Dict[str, str]:
     return context_fields
 
 
+def detect_page_stage(html: str) -> Optional[str]:
+    match = re.search(r'data-hak-page="([^"]+)"', html)
+    if match:
+        return match.group(1)
+    match = re.search(r"<title>([^<]+)</title>", html, re.I)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
 def looks_like_success(status: int, body_text: str) -> bool:
     if status in (200, 201, 202, 204):
         if re.search(r"(code|verification|verify|email).*(sent|send)", body_text, re.I):
@@ -677,7 +705,7 @@ def attempt_signup_requests(
     context_fields: Dict[str, str],
     referer: str,
     dump_dir: Optional[str],
-) -> bool:
+) -> Tuple[bool, bool]:
     payload = build_payload(email, password, name, invite_code, captcha_token, captcha_fields)
     headers = {
         "Content-Type": "application/json",
@@ -685,6 +713,7 @@ def attempt_signup_requests(
         "Origin": base_url,
         "Referer": referer,
     }
+    all_404 = True
 
     for endpoint in endpoints:
         if endpoint.endswith("/api/auth/signin/email"):
@@ -699,9 +728,11 @@ def attempt_signup_requests(
         dump_response(dump_dir, f"signup_{endpoint.rsplit('/', 1)[-1]}", status, resp_headers, body)
         body_text = decode_body(body, resp_headers)
         eprint(f"[signup] {endpoint} status={status}")
+        if status != 404:
+            all_404 = False
         if looks_like_success(status, body_text):
             eprint("[signup] success signal detected")
-            return True
+            return True, all_404
         if is_user_mgmt:
             form_data = urllib.parse.urlencode(payload_to_send).encode("utf-8")
             form_headers = dict(headers)
@@ -712,10 +743,12 @@ def attempt_signup_requests(
             )
             body_text = decode_body(body, resp_headers)
             eprint(f"[signup-form] {endpoint} status={status}")
+            if status != 404:
+                all_404 = False
             if looks_like_success(status, body_text):
                 eprint("[signup-form] success signal detected")
-                return True
-    return False
+                return True, all_404
+    return False, all_404
 
 
 def main() -> int:
@@ -757,10 +790,14 @@ def main() -> int:
     client = HttpClient(args.user_agent, args.proxy, args.timeout)
     signup_url = urllib.parse.urljoin(args.base_url, args.signup_path)
     eprint(f"[flow] HEAD {signup_url}")
-    head_status, head_headers, _ = client.head(signup_url, headers={"Accept": "text/html,*/*"})
+    head_status, head_headers, _ = client.head(
+        signup_url, headers={"Accept": "text/html,*/*"}, allow_redirects=False
+    )
     dump_response(args.dump_dir, "signup_head", head_status, head_headers, b"")
-    page_url = client.last_url or signup_url
-    if page_url != signup_url:
+    page_url = signup_url
+    redirect_location = head_headers.get("Location")
+    if head_status in (301, 302, 303, 307, 308) and redirect_location:
+        page_url = urllib.parse.urljoin(signup_url, redirect_location)
         eprint(f"[flow] redirect detected: {page_url}")
 
     eprint(f"[flow] GET {page_url}")
@@ -770,6 +807,9 @@ def main() -> int:
     page_origin = get_origin(page_url)
     if page_url != signup_url:
         eprint(f"[flow] landing page: {page_url}")
+    stage = detect_page_stage(body_text)
+    if stage:
+        eprint(f"[flow] page stage: {stage}")
 
     if is_cf_challenge(status, headers, body_text):
         if not args.capsolver_key:
@@ -827,6 +867,9 @@ def main() -> int:
         if is_cf_challenge(status, headers, body_text):
             eprint("Cloudflare challenge still present after CapSolver.")
             return 3
+        stage = detect_page_stage(body_text)
+        if stage:
+            eprint(f"[flow] page stage: {stage}")
 
     turnstile_sitekey = extract_turnstile_sitekey(body_text)
     captcha_token = None
@@ -889,7 +932,7 @@ def main() -> int:
         eprint(f"[flow] next-auth origin: {nextauth_origin}")
 
     eprint(f"[flow] trying {len(endpoints)} endpoints")
-    success = attempt_signup_requests(
+    success, all_404 = attempt_signup_requests(
         client=client,
         base_url=api_origin,
         endpoints=endpoints,
@@ -903,6 +946,43 @@ def main() -> int:
         referer=referer,
         dump_dir=args.dump_dir,
     )
+
+    if not success and all_404:
+        alt_origin = None
+        if api_origin.endswith("authenticator.cursor.sh"):
+            alt_origin = "https://authenticate.cursor.sh"
+        elif api_origin.endswith("authenticate.cursor.sh"):
+            alt_origin = "https://authenticator.cursor.sh"
+        if alt_origin:
+            eprint(f"[flow] retrying endpoints on {alt_origin}")
+            alt_endpoints: List[str] = []
+            for endpoint in endpoints:
+                if endpoint.startswith("http"):
+                    parts = urllib.parse.urlsplit(endpoint)
+                    if parts.netloc == urllib.parse.urlsplit(api_origin).netloc:
+                        swapped = urllib.parse.urlsplit(alt_origin)
+                        alt_url = urllib.parse.urlunsplit(
+                            (swapped.scheme, swapped.netloc, parts.path, parts.query, parts.fragment)
+                        )
+                        alt_endpoints.append(alt_url)
+                    else:
+                        alt_endpoints.append(endpoint)
+                else:
+                    alt_endpoints.append(urllib.parse.urljoin(alt_origin, endpoint))
+            success, _ = attempt_signup_requests(
+                client=client,
+                base_url=alt_origin,
+                endpoints=alt_endpoints,
+                email=args.email,
+                password=args.password,
+                name=args.name,
+                invite_code=args.invite_code,
+                captcha_token=captcha_token,
+                captcha_fields=captcha_fields,
+                context_fields=context_fields,
+                referer=referer,
+                dump_dir=args.dump_dir,
+            )
 
     if not success:
         eprint("[flow] fallback to next-auth email attempt")
