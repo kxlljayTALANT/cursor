@@ -144,7 +144,14 @@ def is_cf_challenge(status: int, headers: Dict[str, str], body_text: str) -> boo
     return False
 
 
-def set_cookie(jar: http.cookiejar.CookieJar, domain: str, name: str, value: str) -> None:
+def set_cookie(
+    jar: http.cookiejar.CookieJar,
+    domain: str,
+    name: str,
+    value: str,
+    path: str = "/",
+    secure: bool = True,
+) -> None:
     cookie = http.cookiejar.Cookie(
         version=0,
         name=name,
@@ -154,9 +161,9 @@ def set_cookie(jar: http.cookiejar.CookieJar, domain: str, name: str, value: str
         domain=domain,
         domain_specified=True,
         domain_initial_dot=domain.startswith("."),
-        path="/",
+        path=path,
         path_specified=True,
-        secure=True,
+        secure=secure,
         expires=None,
         discard=True,
         comment=None,
@@ -320,6 +327,61 @@ def extract_cf_clearance(solution: Dict[str, object]) -> Optional[str]:
     return None
 
 
+def parse_cookie_parts(cookie_str: str) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+    parts = [part.strip() for part in cookie_str.split(";") if part.strip()]
+    if not parts:
+        return None, None, None, "/"
+    if "=" not in parts[0]:
+        return None, None, None, "/"
+    name, value = parts[0].split("=", 1)
+    domain = None
+    path = "/"
+    for part in parts[1:]:
+        lower = part.lower()
+        if lower.startswith("domain="):
+            domain = part.split("=", 1)[1]
+        elif lower.startswith("path="):
+            path = part.split("=", 1)[1]
+    return name, value, domain, path
+
+
+def apply_solution_cookies(
+    client: HttpClient, base_url: str, solution: Dict[str, object]
+) -> List[Tuple[str, str]]:
+    applied: List[Tuple[str, str]] = []
+    default_domain = "." + urllib.parse.urlsplit(base_url).netloc
+
+    cookies_list = solution.get("cookies")
+    if isinstance(cookies_list, list):
+        for item in cookies_list:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            value = item.get("value")
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            domain = item.get("domain")
+            path = item.get("path") or "/"
+            secure = bool(item.get("secure", True))
+            if not isinstance(domain, str) or not domain:
+                domain = default_domain
+            if not isinstance(path, str) or not path:
+                path = "/"
+            set_cookie(client.cookie_jar, domain, name, value, path=path, secure=secure)
+            applied.append((name, domain))
+
+    cookie_blob = solution.get("cookie")
+    if isinstance(cookie_blob, str):
+        name, value, domain, path = parse_cookie_parts(cookie_blob)
+        if name and value:
+            if not domain:
+                domain = default_domain
+            set_cookie(client.cookie_jar, domain, name, value, path=path)
+            applied.append((name, domain))
+
+    return applied
+
+
 def apply_capsolver_solution(
     client: HttpClient, base_url: str, solution: Dict[str, object]
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -328,8 +390,12 @@ def apply_capsolver_solution(
         client.user_agent = user_agent
         eprint(f"[capsolver] using user agent from solution: {user_agent}")
 
+    applied_cookies = apply_solution_cookies(client, base_url, solution)
+    if applied_cookies:
+        eprint(f"[capsolver] applied cookies: {', '.join(name for name, _ in applied_cookies)}")
+
     cf_clearance = extract_cf_clearance(solution)
-    if cf_clearance:
+    if cf_clearance and not any(name == "cf_clearance" for name, _ in applied_cookies):
         domain = "." + urllib.parse.urlsplit(base_url).netloc
         set_cookie(client.cookie_jar, domain, "cf_clearance", cf_clearance)
         eprint("[capsolver] applied cf_clearance cookie")
@@ -355,6 +421,15 @@ def solve_with_capsolver(
     if not isinstance(solution, dict):
         raise RuntimeError(f"CapSolver result missing solution: {result}")
     return solution
+
+
+def dump_capsolver_solution(dump_dir: Optional[str], solution: Dict[str, object]) -> None:
+    if not dump_dir:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, "capsolver_solution.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(solution, handle, ensure_ascii=True, indent=2)
 
 
 def dump_response(
@@ -529,6 +604,11 @@ def main() -> int:
     )
     parser.add_argument("--endpoints", help="Comma-separated API endpoints to try.")
     parser.add_argument("--dump-dir", help="Write response dumps to this directory.")
+    parser.add_argument(
+        "--dump-capsolver-solution",
+        action="store_true",
+        help="Write CapSolver solution JSON to dump dir.",
+    )
     args = parser.parse_args()
 
     client = HttpClient(args.user_agent, args.proxy, args.timeout)
@@ -592,6 +672,8 @@ def main() -> int:
             poll_interval=args.poll_interval,
             poll_timeout=args.poll_timeout,
         )
+        if args.dump_capsolver_solution:
+            dump_capsolver_solution(args.dump_dir, solution)
         apply_capsolver_solution(client, page_origin, solution)
         eprint(f"[flow] retry GET {page_url}")
         status, headers, body = client.get(page_url)
@@ -626,6 +708,8 @@ def main() -> int:
             poll_interval=args.poll_interval,
             poll_timeout=args.poll_timeout,
         )
+        if args.dump_capsolver_solution:
+            dump_capsolver_solution(args.dump_dir, solution)
         captcha_token, _ = apply_capsolver_solution(client, page_origin, solution)
         if not captcha_token:
             eprint("Turnstile solved but no token found in solution.")

@@ -45,6 +45,10 @@ via CapSolver and can solve Turnstile when present.
 
   `--dump-dir ./dumps`
 
+- Save CapSolver solution JSON (debugging only):
+
+  `--dump-dir ./dumps --dump-capsolver-solution`
+
 ## Notes
 
 - The script is best-effort and relies on current Cursor endpoints. If endpoints change,
