@@ -557,6 +557,9 @@ def fetch_js_endpoints(
     paths = extract_js_chunk_paths(html)
     if not paths:
         return []
+    prioritized = [path for path in paths if "sign-up" in path]
+    prioritized.extend([path for path in paths if "sign-up" not in path])
+    paths = list(dict.fromkeys(prioritized))
     endpoints: List[str] = []
     for path in paths[:limit]:
         url = urllib.parse.urljoin(page_origin, path)
