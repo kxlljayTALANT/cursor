@@ -564,19 +564,25 @@ def main() -> int:
             )
             if sitekey:
                 eprint(f"[flow] sitekey extracted from challenge: {sitekey}")
-        if not sitekey and not args.capsolver_task_type and not args.capsolver_task_json:
-            eprint(
-                "Cloudflare challenge did not expose a Turnstile sitekey. "
-                "Provide --capsolver-task-type or --capsolver-task-json."
-            )
-            return 5
+        task_type_override = args.capsolver_task_type
+        if not sitekey and not task_type_override and not args.capsolver_task_json:
+            if args.proxy:
+                task_type_override = "AntiCloudflareTask"
+                eprint("[flow] proxy detected, using AntiCloudflareTask")
+            else:
+                eprint(
+                    "Cloudflare challenge did not expose a Turnstile sitekey. "
+                    "Provide --capsolver-task-type/--capsolver-task-json or "
+                    "use --proxy for AntiCloudflareTask."
+                )
+                return 5
         task = build_capsolver_task(
             url=page_url,
             user_agent=client.user_agent,
             proxy=args.proxy,
             html=body_text,
             sitekey=sitekey,
-            task_type=args.capsolver_task_type,
+            task_type=task_type_override,
             task_json=args.capsolver_task_json,
         )
         solution = solve_with_capsolver(

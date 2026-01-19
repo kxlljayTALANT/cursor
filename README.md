@@ -37,6 +37,10 @@ via CapSolver and can solve Turnstile when present.
 
   `--endpoints /api/auth/sign-up,/api/auth/send-code`
 
+- Cloudflare managed challenge without a Turnstile sitekey:
+
+  `--proxy http://user:pass@host:port --capsolver-task-type AntiCloudflareTask`
+
 - Write response dumps to a directory for debugging:
 
   `--dump-dir ./dumps`
