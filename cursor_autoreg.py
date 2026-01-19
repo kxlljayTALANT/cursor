@@ -39,6 +39,10 @@ TURNSTILE_KEY_PATTERNS = [
     r"'sitekey'\s*:\s*'([^']+)'",
 ]
 
+CF_SCRIPT_PATTERNS = [
+    r'["\'](/cdn-cgi/challenge-platform/[^"\']+chl_page/v1[^"\']*)["\']',
+]
+
 DEFAULT_ENDPOINTS = [
     "/api/auth/signup",
     "/api/auth/sign-up",
@@ -116,6 +120,14 @@ def rank_endpoints(endpoints: Iterable[str]) -> List[str]:
 
 def extract_turnstile_sitekey(html: str) -> Optional[str]:
     for pattern in TURNSTILE_KEY_PATTERNS:
+        match = re.search(pattern, html)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_challenge_script_path(html: str) -> Optional[str]:
+    for pattern in CF_SCRIPT_PATTERNS:
         match = re.search(pattern, html)
         if match:
             return match.group(1)
@@ -391,6 +403,29 @@ def looks_like_success(status: int, body_text: str) -> bool:
     return False
 
 
+def fetch_turnstile_sitekey_from_challenge(
+    client: HttpClient,
+    page_url: str,
+    page_origin: str,
+    html: str,
+    dump_dir: Optional[str],
+) -> Optional[str]:
+    script_path = extract_challenge_script_path(html)
+    if not script_path:
+        return None
+    script_url = urllib.parse.urljoin(page_origin, script_path)
+    eprint(f"[flow] fetching challenge script: {script_url}")
+    status, headers, body = client.get(
+        script_url,
+        headers={"Accept": "*/*", "Referer": page_url},
+    )
+    dump_response(dump_dir, "cf_challenge_script", status, headers, body)
+    if status >= 400:
+        return None
+    script_text = decode_body(body, headers)
+    return extract_turnstile_sitekey(script_text)
+
+
 def try_nextauth_email(
     client: HttpClient,
     base_url: str,
@@ -519,6 +554,22 @@ def main() -> int:
             return 2
         eprint("[flow] Cloudflare challenge detected")
         sitekey = extract_turnstile_sitekey(body_text)
+        if not sitekey:
+            sitekey = fetch_turnstile_sitekey_from_challenge(
+                client=client,
+                page_url=page_url,
+                page_origin=page_origin,
+                html=body_text,
+                dump_dir=args.dump_dir,
+            )
+            if sitekey:
+                eprint(f"[flow] sitekey extracted from challenge: {sitekey}")
+        if not sitekey and not args.capsolver_task_type and not args.capsolver_task_json:
+            eprint(
+                "Cloudflare challenge did not expose a Turnstile sitekey. "
+                "Provide --capsolver-task-type or --capsolver-task-json."
+            )
+            return 5
         task = build_capsolver_task(
             url=page_url,
             user_agent=client.user_agent,
