@@ -66,6 +66,18 @@ def get_origin(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
+def extract_redirect_origin(url: str) -> Optional[str]:
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parts.query)
+    redirect_values = query.get("redirect_uri")
+    if not redirect_values:
+        return None
+    redirect_url = redirect_values[0]
+    if not redirect_url:
+        return None
+    return get_origin(redirect_url)
+
+
 def normalize_endpoints(base_url: str, endpoints: Iterable[str]) -> List[str]:
     normalized = []
     for ep in endpoints:
@@ -156,6 +168,7 @@ class HttpClient:
         self.user_agent = user_agent
         self.timeout = timeout
         self.cookie_jar = http.cookiejar.CookieJar()
+        self.last_url: Optional[str] = None
 
         handlers = [urllib.request.HTTPCookieProcessor(self.cookie_jar)]
         if proxy:
@@ -174,12 +187,15 @@ class HttpClient:
         req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
+                self.last_url = resp.geturl()
                 body = resp.read()
                 return resp.status, dict(resp.headers), body
         except urllib.error.HTTPError as exc:
+            self.last_url = exc.geturl()
             body = exc.read()
             return exc.code, dict(exc.headers), body
         except urllib.error.URLError as exc:
+            self.last_url = None
             raise RuntimeError(f"Request failed: {exc}") from exc
 
     def get(self, url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
@@ -483,6 +499,10 @@ def main() -> int:
     status, headers, body = client.get(signup_url)
     dump_response(args.dump_dir, "signup_page_initial", status, headers, body)
     body_text = decode_body(body, headers)
+    page_url = client.last_url or signup_url
+    page_origin = get_origin(page_url)
+    if page_url != signup_url:
+        eprint(f"[flow] landing page: {page_url}")
 
     if is_cf_challenge(status, headers, body_text):
         if not args.capsolver_key:
@@ -491,7 +511,7 @@ def main() -> int:
         eprint("[flow] Cloudflare challenge detected")
         sitekey = extract_turnstile_sitekey(body_text)
         task = build_capsolver_task(
-            url=signup_url,
+            url=page_url,
             user_agent=client.user_agent,
             proxy=args.proxy,
             html=body_text,
@@ -506,11 +526,13 @@ def main() -> int:
             poll_interval=args.poll_interval,
             poll_timeout=args.poll_timeout,
         )
-        apply_capsolver_solution(client, args.base_url, solution)
-        eprint(f"[flow] retry GET {signup_url}")
-        status, headers, body = client.get(signup_url)
+        apply_capsolver_solution(client, page_origin, solution)
+        eprint(f"[flow] retry GET {page_url}")
+        status, headers, body = client.get(page_url)
         dump_response(args.dump_dir, "signup_page_after_cf", status, headers, body)
         body_text = decode_body(body, headers)
+        page_url = client.last_url or page_url
+        page_origin = get_origin(page_url)
         if is_cf_challenge(status, headers, body_text):
             eprint("Cloudflare challenge still present after CapSolver.")
             return 3
@@ -523,7 +545,7 @@ def main() -> int:
             return 4
         eprint(f"[flow] Turnstile sitekey detected: {turnstile_sitekey}")
         task = build_capsolver_task(
-            url=signup_url,
+            url=page_url,
             user_agent=client.user_agent,
             proxy=args.proxy,
             html=None,
@@ -538,7 +560,7 @@ def main() -> int:
             poll_interval=args.poll_interval,
             poll_timeout=args.poll_timeout,
         )
-        captcha_token, _ = apply_capsolver_solution(client, args.base_url, solution)
+        captcha_token, _ = apply_capsolver_solution(client, page_origin, solution)
         if not captcha_token:
             eprint("Turnstile solved but no token found in solution.")
 
@@ -548,15 +570,19 @@ def main() -> int:
     else:
         extracted = extract_api_candidates(body_text)
         endpoints = extracted or DEFAULT_ENDPOINTS
-    endpoints = normalize_endpoints(args.base_url, rank_endpoints(endpoints))
+    api_origin = page_origin
+    endpoints = normalize_endpoints(api_origin, rank_endpoints(endpoints))
 
     captcha_fields = [item.strip() for item in args.captcha_fields.split(",") if item.strip()]
-    referer = signup_url
+    referer = page_url
+    nextauth_origin = extract_redirect_origin(page_url) or page_origin
+    if nextauth_origin != page_origin:
+        eprint(f"[flow] next-auth origin: {nextauth_origin}")
 
     eprint(f"[flow] trying {len(endpoints)} endpoints")
     success = attempt_signup_requests(
         client=client,
-        base_url=args.base_url,
+        base_url=api_origin,
         endpoints=endpoints,
         email=args.email,
         password=args.password,
@@ -572,7 +598,7 @@ def main() -> int:
         eprint("[flow] fallback to next-auth email attempt")
         success = try_nextauth_email(
             client=client,
-            base_url=args.base_url,
+            base_url=nextauth_origin,
             email=args.email,
             referer=referer,
             dump_dir=args.dump_dir,
