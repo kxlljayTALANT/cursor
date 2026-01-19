@@ -574,6 +574,17 @@ def fetch_js_endpoints(
             safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", path.strip("/"))
             with open(os.path.join(dump_dir, f"js_{safe_name}"), "w", encoding="utf-8") as handle:
                 handle.write(js_text)
+            if "sign-up" in path or "page-" in path:
+                map_url = url + ".map"
+                map_status, map_headers, map_body = client.get(
+                    map_url, headers={"Accept": "*/*", "Referer": page_url}
+                )
+                if map_status < 400:
+                    map_text = decode_body(map_body, map_headers)
+                    with open(
+                        os.path.join(dump_dir, f"js_{safe_name}.map"), "w", encoding="utf-8"
+                    ) as handle:
+                        handle.write(map_text)
         endpoints.extend(extract_js_endpoints(js_text))
     return list(dict.fromkeys(endpoints))
 
