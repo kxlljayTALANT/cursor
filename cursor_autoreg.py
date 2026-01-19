@@ -43,6 +43,16 @@ CF_SCRIPT_PATTERNS = [
     r'["\'](/cdn-cgi/challenge-platform/[^"\']+chl_page/v1[^"\']*)["\']',
 ]
 
+JS_CHUNK_PATTERNS = [
+    r'["\'](/_next/static/chunks/[^"\']+\.js)["\']',
+]
+
+JS_ENDPOINT_PATTERNS = [
+    r'["\'](\/user_management\/[^"\']+)["\']',
+    r'["\'](\/api\/auth\/[^"\']+)["\']',
+    r'["\'](https:\/\/[^"\']+\/user_management\/[^"\']+)["\']',
+    r'["\'](https:\/\/[^"\']+\/api\/auth\/[^"\']+)["\']',
+]
 DEFAULT_ENDPOINTS = [
     "/api/auth/signup",
     "/api/auth/sign-up",
@@ -99,6 +109,7 @@ def extract_api_candidates(html: str) -> List[str]:
 
 def rank_endpoints(endpoints: Iterable[str]) -> List[str]:
     keywords = [
+        "user_management",
         "sign-up",
         "signup",
         "register",
@@ -132,6 +143,20 @@ def extract_challenge_script_path(html: str) -> Optional[str]:
         if match:
             return match.group(1)
     return None
+
+
+def extract_js_chunk_paths(html: str) -> List[str]:
+    paths: List[str] = []
+    for pattern in JS_CHUNK_PATTERNS:
+        paths.extend(re.findall(pattern, html))
+    return list(dict.fromkeys(paths))
+
+
+def extract_js_endpoints(js_text: str) -> List[str]:
+    endpoints: List[str] = []
+    for pattern in JS_ENDPOINT_PATTERNS:
+        endpoints.extend(re.findall(pattern, js_text))
+    return list(dict.fromkeys(endpoints))
 
 
 def is_cf_challenge(status: int, headers: Dict[str, str], body_text: str) -> bool:
@@ -476,6 +501,17 @@ def build_payload(
     return payload
 
 
+def build_context_fields(page_url: str) -> Dict[str, str]:
+    parts = urllib.parse.urlsplit(page_url)
+    query = urllib.parse.parse_qs(parts.query)
+    context_fields: Dict[str, str] = {}
+    for key in ("client_id", "redirect_uri", "state", "authorization_session_id"):
+        values = query.get(key)
+        if values:
+            context_fields[key] = values[0]
+    return context_fields
+
+
 def looks_like_success(status: int, body_text: str) -> bool:
     if status in (200, 201, 202, 204):
         if re.search(r"(code|verification|verify|email).*(sent|send)", body_text, re.I):
@@ -505,6 +541,27 @@ def fetch_turnstile_sitekey_from_challenge(
         return None
     script_text = decode_body(body, headers)
     return extract_turnstile_sitekey(script_text)
+
+
+def fetch_js_endpoints(
+    client: HttpClient,
+    page_url: str,
+    page_origin: str,
+    html: str,
+    limit: int,
+) -> List[str]:
+    paths = extract_js_chunk_paths(html)
+    if not paths:
+        return []
+    endpoints: List[str] = []
+    for path in paths[:limit]:
+        url = urllib.parse.urljoin(page_origin, path)
+        status, headers, body = client.get(url, headers={"Accept": "*/*", "Referer": page_url})
+        if status >= 400:
+            continue
+        js_text = decode_body(body, headers)
+        endpoints.extend(extract_js_endpoints(js_text))
+    return list(dict.fromkeys(endpoints))
 
 
 def try_nextauth_email(
@@ -562,6 +619,7 @@ def attempt_signup_requests(
     invite_code: Optional[str],
     captcha_token: Optional[str],
     captcha_fields: List[str],
+    context_fields: Dict[str, str],
     referer: str,
     dump_dir: Optional[str],
 ) -> bool:
@@ -576,7 +634,12 @@ def attempt_signup_requests(
     for endpoint in endpoints:
         if endpoint.endswith("/api/auth/signin/email"):
             continue
-        data = json.dumps(payload).encode("utf-8")
+        is_user_mgmt = "/user_management/" in endpoint
+        if is_user_mgmt and context_fields:
+            payload_to_send = {**payload, **context_fields}
+        else:
+            payload_to_send = payload
+        data = json.dumps(payload_to_send).encode("utf-8")
         status, resp_headers, body = client.post(endpoint, headers=headers, data=data)
         dump_response(dump_dir, f"signup_{endpoint.rsplit('/', 1)[-1]}", status, resp_headers, body)
         body_text = decode_body(body, resp_headers)
@@ -584,6 +647,19 @@ def attempt_signup_requests(
         if looks_like_success(status, body_text):
             eprint("[signup] success signal detected")
             return True
+        if is_user_mgmt:
+            form_data = urllib.parse.urlencode(payload_to_send).encode("utf-8")
+            form_headers = dict(headers)
+            form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            status, resp_headers, body = client.post(endpoint, headers=form_headers, data=form_data)
+            dump_response(
+                dump_dir, f"signup_{endpoint.rsplit('/', 1)[-1]}_form", status, resp_headers, body
+            )
+            body_text = decode_body(body, resp_headers)
+            eprint(f"[signup-form] {endpoint} status={status}")
+            if looks_like_success(status, body_text):
+                eprint("[signup-form] success signal detected")
+                return True
     return False
 
 
@@ -610,6 +686,7 @@ def main() -> int:
     )
     parser.add_argument("--endpoints", help="Comma-separated API endpoints to try.")
     parser.add_argument("--dump-dir", help="Write response dumps to this directory.")
+    parser.add_argument("--js-chunk-limit", type=int, default=6)
     parser.add_argument(
         "--dump-capsolver-solution",
         action="store_true",
@@ -727,11 +804,21 @@ def main() -> int:
         extracted = extract_api_candidates(body_text)
         endpoints = extracted or DEFAULT_ENDPOINTS
     api_origin = page_origin
+    js_endpoints = fetch_js_endpoints(
+        client=client,
+        page_url=page_url,
+        page_origin=page_origin,
+        html=body_text,
+        limit=args.js_chunk_limit,
+    )
+    if js_endpoints:
+        endpoints = list(dict.fromkeys(js_endpoints + endpoints))
     endpoints = normalize_endpoints(api_origin, rank_endpoints(endpoints))
 
     captcha_fields = [item.strip() for item in args.captcha_fields.split(",") if item.strip()]
     referer = page_url
     nextauth_origin = extract_redirect_origin(page_url) or page_origin
+    context_fields = build_context_fields(page_url)
     if nextauth_origin != page_origin:
         eprint(f"[flow] next-auth origin: {nextauth_origin}")
 
@@ -746,6 +833,7 @@ def main() -> int:
         invite_code=args.invite_code,
         captcha_token=captcha_token,
         captcha_fields=captcha_fields,
+        context_fields=context_fields,
         referer=referer,
         dump_dir=args.dump_dir,
     )

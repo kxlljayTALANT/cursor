@@ -52,6 +52,6 @@ via CapSolver and can solve Turnstile when present.
 ## Notes
 
 - The script is best-effort and relies on current Cursor endpoints. If endpoints change,
-  pass `--endpoints` to target the correct API.
+  pass `--endpoints` or increase `--js-chunk-limit` to scan more JS bundles.
 - The CapSolver task parameters may vary across task types. If needed, provide a raw
   task via `--capsolver-task-json` to override defaults.
