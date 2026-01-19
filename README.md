@@ -33,6 +33,10 @@ via CapSolver and can solve Turnstile when present.
 
   `--capsolver-task-type TurnstileTaskProxyless`
 
+- Send proxy fields to CapSolver (if proxy string fails):
+
+  `--capsolver-proxy-fields`
+
 - Supply explicit API endpoints to try:
 
   `--endpoints /api/auth/sign-up,/api/auth/send-code`

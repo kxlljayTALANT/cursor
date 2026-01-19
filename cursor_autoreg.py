@@ -241,6 +241,25 @@ def extract_cookie_value(cookie_header: str, name: str) -> Optional[str]:
     return None
 
 
+def parse_proxy_fields(proxy: str) -> Optional[Dict[str, object]]:
+    proxy_value = proxy
+    if "://" not in proxy_value:
+        proxy_value = "http://" + proxy_value
+    parts = urllib.parse.urlsplit(proxy_value)
+    if not parts.hostname or not parts.port:
+        return None
+    fields: Dict[str, object] = {
+        "proxyType": parts.scheme or "http",
+        "proxyAddress": parts.hostname,
+        "proxyPort": parts.port,
+    }
+    if parts.username:
+        fields["proxyLogin"] = parts.username
+    if parts.password:
+        fields["proxyPassword"] = parts.password
+    return fields
+
+
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -351,6 +370,7 @@ def build_capsolver_task(
     url: str,
     user_agent: str,
     proxy: Optional[str],
+    proxy_fields: bool,
     html: Optional[str],
     sitekey: Optional[str],
     task_type: Optional[str],
@@ -379,7 +399,14 @@ def build_capsolver_task(
     if user_agent:
         task["userAgent"] = user_agent
     if proxy and not resolved_type.lower().endswith("proxyless"):
-        task["proxy"] = proxy
+        if proxy_fields:
+            fields = parse_proxy_fields(proxy)
+            if fields:
+                task.update(fields)
+            else:
+                task["proxy"] = proxy
+        else:
+            task["proxy"] = proxy
     if html and "Cloudflare" in resolved_type:
         task["html"] = html
     return task
@@ -768,6 +795,11 @@ def main() -> int:
     parser.add_argument("--capsolver-task-type", help="Override CapSolver task type.")
     parser.add_argument("--capsolver-task-json", help="Raw CapSolver task JSON.")
     parser.add_argument(
+        "--capsolver-proxy-fields",
+        action="store_true",
+        help="Send proxy fields instead of proxy string to CapSolver.",
+    )
+    parser.add_argument(
         "--captcha-fields",
         default="turnstileToken,captchaToken,cfTurnstileResponse",
         help="Comma-separated fields for captcha token in signup payload.",
@@ -843,6 +875,7 @@ def main() -> int:
             url=page_url,
             user_agent=client.user_agent,
             proxy=args.proxy,
+            proxy_fields=args.capsolver_proxy_fields,
             html=body_text,
             sitekey=sitekey,
             task_type=task_type_override,
@@ -882,6 +915,7 @@ def main() -> int:
             url=page_url,
             user_agent=client.user_agent,
             proxy=args.proxy,
+            proxy_fields=args.capsolver_proxy_fields,
             html=None,
             sitekey=turnstile_sitekey,
             task_type=args.capsolver_task_type,
