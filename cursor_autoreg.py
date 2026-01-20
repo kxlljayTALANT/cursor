@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""
+HTTP-only Cursor AI sign-up helper.
+
+Flow:
+1) GET /sign-up
+2) If Cloudflare challenge detected, solve via CapSolver and retry
+3) If Turnstile is present, solve and attach token
+4) Try API endpoints to trigger email code
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.cookiejar
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Dict, Iterable, List, Optional, Tuple
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+CAPSOLVER_CREATE_URL = "https://api.capsolver.com/createTask"
+CAPSOLVER_RESULT_URL = "https://api.capsolver.com/getTaskResult"
+
+TURNSTILE_KEY_PATTERNS = [
+    r'data-sitekey="([^"]+)"',
+    r"data-sitekey='([^']+)'",
+    r'"sitekey"\s*:\s*"([^"]+)"',
+    r"'sitekey'\s*:\s*'([^']+)'",
+]
+
+CF_SCRIPT_PATTERNS = [
+    r'["\'](/cdn-cgi/challenge-platform/[^"\']+chl_page/v1[^"\']*)["\']',
+]
+
+JS_CHUNK_PATTERNS = [
+    r'["\'](/_next/static/chunks/[^"\']+\.js)["\']',
+]
+
+JS_ENDPOINT_PATTERNS = [
+    r'["\'](\/user_management\/[^"\']+)["\']',
+    r'["\'](\/api\/auth\/[^"\']+)["\']',
+    r'["\'](https:\/\/[^"\']+\/user_management\/[^"\']+)["\']',
+    r'["\'](https:\/\/[^"\']+\/api\/auth\/[^"\']+)["\']',
+    r"(\/user_management\/[A-Za-z0-9_\-\/]+)",
+    r"(\/api\/auth\/[A-Za-z0-9_\-\/]+)",
+    r"(https:\/\/[A-Za-z0-9.\-]+\/user_management\/[A-Za-z0-9_\-\/]+)",
+    r"(https:\/\/[A-Za-z0-9.\-]+\/api\/auth\/[A-Za-z0-9_\-\/]+)",
+]
+DEFAULT_ENDPOINTS = [
+    "/api/auth/signup",
+    "/api/auth/sign-up",
+    "/api/auth/register",
+    "/api/auth/send-code",
+    "/api/auth/send-otp",
+    "/api/auth/email",
+    "/api/auth/signin/email",
+]
+
+USER_MANAGEMENT_ENDPOINTS = [
+    "/user_management/authorize",
+    "/user_management/authorize/identify",
+    "/user_management/authorize/sign_up",
+    "/user_management/authorize/registration",
+    "/user_management/authorize/send_email",
+    "/user_management/authorize/send_code",
+    "/user_management/authorize/send-otp",
+    "/user_management/authorize/verify",
+    "/user_management/authorize/verify_email",
+    "/user_management/authorize/verification",
+    "/user_management/authorize/email",
+    "/user_management/authorize/passwordless",
+    "/user_management/authorize/continue",
+    "/user_management/authorize/complete",
+    "/user_management/authorization",
+    "/user_management/authorization_session",
+    "/user_management/authorization_sessions",
+    "/user_management/authorization_sessions/email",
+    "/user_management/authorization_sessions/send_code",
+    "/user_management/authorization_sessions/send-otp",
+    "/user_management/authorization_sessions/verify",
+    "/user_management/sign_up",
+    "/user_management/sign-up",
+    "/user_management/register",
+    "/user_management/send_email_verification",
+    "/user_management/verify_email",
+    "/user_management/email",
+]
+
+
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def decode_body(body: bytes, headers: Dict[str, str]) -> str:
+    content_type = headers.get("Content-Type", "")
+    match = re.search(r"charset=([^\s;]+)", content_type)
+    charset = match.group(1) if match else "utf-8"
+    return body.decode(charset, errors="replace")
+
+
+def get_origin(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def extract_redirect_origin(url: str) -> Optional[str]:
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parts.query)
+    redirect_values = query.get("redirect_uri")
+    if not redirect_values:
+        return None
+    redirect_url = redirect_values[0]
+    if not redirect_url:
+        return None
+    return get_origin(redirect_url)
+
+
+def normalize_endpoints(base_url: str, endpoints: Iterable[str]) -> List[str]:
+    normalized = []
+    for ep in endpoints:
+        ep = ep.strip()
+        if not ep:
+            continue
+        normalized.append(urllib.parse.urljoin(base_url, ep))
+    return normalized
+
+
+def extract_api_candidates(html: str) -> List[str]:
+    candidates = set(re.findall(r'["\'](\/api\/[^"\']+)["\']', html))
+    return sorted(candidates)
+
+
+def rank_endpoints(endpoints: Iterable[str]) -> List[str]:
+    keywords = [
+        "user_management",
+        "sign-up",
+        "signup",
+        "register",
+        "send-code",
+        "send-otp",
+        "verify",
+        "verification",
+        "email",
+        "signin",
+    ]
+
+    def score(url: str) -> Tuple[int, int]:
+        lower = url.lower()
+        hits = sum(1 for key in keywords if key in lower)
+        return (-hits, len(url))
+
+    return sorted(endpoints, key=score)
+
+
+def extract_turnstile_sitekey(html: str) -> Optional[str]:
+    for pattern in TURNSTILE_KEY_PATTERNS:
+        match = re.search(pattern, html)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_challenge_script_path(html: str) -> Optional[str]:
+    for pattern in CF_SCRIPT_PATTERNS:
+        match = re.search(pattern, html)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_js_chunk_paths(html: str) -> List[str]:
+    paths: List[str] = []
+    for pattern in JS_CHUNK_PATTERNS:
+        paths.extend(re.findall(pattern, html))
+    return list(dict.fromkeys(paths))
+
+
+def extract_js_endpoints(js_text: str) -> List[str]:
+    endpoints: List[str] = []
+    for pattern in JS_ENDPOINT_PATTERNS:
+        endpoints.extend(re.findall(pattern, js_text))
+    return list(dict.fromkeys(endpoints))
+
+
+def is_cf_challenge(status: int, headers: Dict[str, str], body_text: str) -> bool:
+    if headers.get("cf-mitigated") == "challenge":
+        return True
+    if "cdn-cgi/challenge-platform" in body_text:
+        return True
+    if status in (403, 503) and "Just a moment" in body_text:
+        return True
+    return False
+
+
+def set_cookie(
+    jar: http.cookiejar.CookieJar,
+    domain: str,
+    name: str,
+    value: str,
+    path: str = "/",
+    secure: bool = True,
+) -> None:
+    cookie = http.cookiejar.Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=True,
+        domain_initial_dot=domain.startswith("."),
+        path=path,
+        path_specified=True,
+        secure=secure,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={"HttpOnly": None},
+        rfc2109=False,
+    )
+    jar.set_cookie(cookie)
+
+
+def extract_cookie_value(cookie_header: str, name: str) -> Optional[str]:
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith(name + "="):
+            return part.split("=", 1)[1]
+    return None
+
+
+def parse_proxy_fields(proxy: str) -> Optional[Dict[str, object]]:
+    proxy_value = proxy
+    if "://" not in proxy_value:
+        proxy_value = "http://" + proxy_value
+    parts = urllib.parse.urlsplit(proxy_value)
+    if not parts.hostname or not parts.port:
+        return None
+    fields: Dict[str, object] = {
+        "proxyType": parts.scheme or "http",
+        "proxyAddress": parts.hostname,
+        "proxyPort": parts.port,
+    }
+    if parts.username:
+        fields["proxyLogin"] = parts.username
+    if parts.password:
+        fields["proxyPassword"] = parts.password
+    return fields
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class HttpClient:
+    def __init__(self, user_agent: str, proxy: Optional[str], timeout: int) -> None:
+        self.user_agent = user_agent
+        self.timeout = timeout
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.last_url: Optional[str] = None
+
+        handlers = [urllib.request.HTTPCookieProcessor(self.cookie_jar)]
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        self.opener = urllib.request.build_opener(*handlers)
+        self.opener_no_redirect = urllib.request.build_opener(
+            *handlers, NoRedirectHandler()
+        )
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        allow_redirects: bool = True,
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        request_headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "*/*",
+        }
+        if headers:
+            request_headers.update(headers)
+        req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        try:
+            opener = self.opener if allow_redirects else self.opener_no_redirect
+            with opener.open(req, timeout=self.timeout) as resp:
+                self.last_url = resp.geturl()
+                body = resp.read()
+                return resp.status, dict(resp.headers), body
+        except urllib.error.HTTPError as exc:
+            self.last_url = exc.geturl()
+            body = exc.read()
+            return exc.code, dict(exc.headers), body
+        except urllib.error.URLError as exc:
+            self.last_url = None
+            raise RuntimeError(f"Request failed: {exc}") from exc
+
+    def get(
+        self, url: str, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = True
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        return self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
+
+    def head(
+        self, url: str, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = True
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        return self.request("HEAD", url, headers=headers, allow_redirects=allow_redirects)
+
+    def post(
+        self, url: str, headers: Optional[Dict[str, str]] = None, data: Optional[bytes] = None
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        return self.request("POST", url, headers=headers, data=data)
+
+
+def capsolver_request(url: str, payload: Dict[str, object], timeout: int) -> Dict[str, object]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        raise RuntimeError(f"CapSolver error: HTTP {exc.code} {body[:200]!r}") from exc
+    try:
+        return json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"CapSolver response is not JSON: {body[:200]!r}") from exc
+
+
+def capsolver_create_task(client_key: str, task: Dict[str, object], timeout: int) -> str:
+    payload = {"clientKey": client_key, "task": task}
+    response = capsolver_request(CAPSOLVER_CREATE_URL, payload, timeout=timeout)
+    if response.get("errorId"):
+        raise RuntimeError(f"CapSolver createTask error: {response}")
+    task_id = response.get("taskId")
+    if not task_id:
+        raise RuntimeError(f"CapSolver createTask missing taskId: {response}")
+    return str(task_id)
+
+
+def capsolver_wait_for_result(
+    client_key: str, task_id: str, timeout: int, poll_interval: int, poll_timeout: int
+) -> Dict[str, object]:
+    payload = {"clientKey": client_key, "taskId": task_id}
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        response = capsolver_request(CAPSOLVER_RESULT_URL, payload, timeout=timeout)
+        if response.get("errorId"):
+            raise RuntimeError(f"CapSolver getTaskResult error: {response}")
+        if response.get("status") == "ready":
+            return response
+        time.sleep(poll_interval)
+    raise RuntimeError("CapSolver timeout waiting for task result")
+
+
+def build_capsolver_task(
+    url: str,
+    user_agent: str,
+    proxy: Optional[str],
+    proxy_fields: bool,
+    html: Optional[str],
+    sitekey: Optional[str],
+    task_type: Optional[str],
+    task_json: Optional[str],
+) -> Dict[str, object]:
+    if task_json:
+        try:
+            task = json.loads(task_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Invalid --capsolver-task-json") from exc
+        if not isinstance(task, dict):
+            raise RuntimeError("--capsolver-task-json must be a JSON object")
+        return task
+
+    if task_type:
+        resolved_type = task_type
+    else:
+        if sitekey:
+            resolved_type = "TurnstileTaskProxyless" if not proxy else "TurnstileTask"
+        else:
+            resolved_type = "CloudflareTask"
+
+    task: Dict[str, object] = {"type": resolved_type, "websiteURL": url}
+    if sitekey:
+        task["websiteKey"] = sitekey
+    if user_agent:
+        task["userAgent"] = user_agent
+    if proxy and not resolved_type.lower().endswith("proxyless"):
+        if proxy_fields:
+            fields = parse_proxy_fields(proxy)
+            if fields:
+                task.update(fields)
+            else:
+                task["proxy"] = proxy
+        else:
+            task["proxy"] = proxy
+    if html and "Cloudflare" in resolved_type:
+        task["html"] = html
+    return task
+
+
+def extract_solution_token(solution: Dict[str, object]) -> Optional[str]:
+    for key in ("token", "gRecaptchaResponse", "cf_turnstile_response", "captchaToken", "answer"):
+        value = solution.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def extract_cf_clearance(solution: Dict[str, object]) -> Optional[str]:
+    for key in ("cf_clearance", "cfClearance"):
+        value = solution.get(key)
+        if isinstance(value, str) and value:
+            return value
+    cookie_blob = solution.get("cookie") or solution.get("cookies")
+    if isinstance(cookie_blob, str) and "cf_clearance=" in cookie_blob:
+        return extract_cookie_value(cookie_blob, "cf_clearance")
+    return None
+
+
+def parse_cookie_parts(cookie_str: str) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+    parts = [part.strip() for part in cookie_str.split(";") if part.strip()]
+    if not parts:
+        return None, None, None, "/"
+    if "=" not in parts[0]:
+        return None, None, None, "/"
+    name, value = parts[0].split("=", 1)
+    domain = None
+    path = "/"
+    for part in parts[1:]:
+        lower = part.lower()
+        if lower.startswith("domain="):
+            domain = part.split("=", 1)[1]
+        elif lower.startswith("path="):
+            path = part.split("=", 1)[1]
+    return name, value, domain, path
+
+
+def apply_solution_cookies(
+    client: HttpClient, base_url: str, solution: Dict[str, object]
+) -> List[Tuple[str, str]]:
+    applied: List[Tuple[str, str]] = []
+    default_domain = "." + urllib.parse.urlsplit(base_url).netloc
+
+    cookies_list = solution.get("cookies")
+    if isinstance(cookies_list, list):
+        for item in cookies_list:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            value = item.get("value")
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            domain = item.get("domain")
+            path = item.get("path") or "/"
+            secure = bool(item.get("secure", True))
+            if not isinstance(domain, str) or not domain:
+                domain = default_domain
+            if not isinstance(path, str) or not path:
+                path = "/"
+            set_cookie(client.cookie_jar, domain, name, value, path=path, secure=secure)
+            applied.append((name, domain))
+    elif isinstance(cookies_list, dict):
+        for name, value in cookies_list.items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            set_cookie(client.cookie_jar, default_domain, name, value, path="/")
+            applied.append((name, default_domain))
+
+    cookie_blob = solution.get("cookie")
+    if isinstance(cookie_blob, str):
+        name, value, domain, path = parse_cookie_parts(cookie_blob)
+        if name and value:
+            if not domain:
+                domain = default_domain
+            set_cookie(client.cookie_jar, domain, name, value, path=path)
+            applied.append((name, domain))
+
+    return applied
+
+
+def apply_capsolver_solution(
+    client: HttpClient, base_url: str, solution: Dict[str, object]
+) -> Tuple[Optional[str], Optional[str]]:
+    user_agent = solution.get("userAgent")
+    if isinstance(user_agent, str) and user_agent:
+        client.user_agent = user_agent
+        eprint(f"[capsolver] using user agent from solution: {user_agent}")
+
+    applied_cookies = apply_solution_cookies(client, base_url, solution)
+    if applied_cookies:
+        eprint(f"[capsolver] applied cookies: {', '.join(name for name, _ in applied_cookies)}")
+
+    cf_clearance = extract_cf_clearance(solution)
+    if cf_clearance and not any(name == "cf_clearance" for name, _ in applied_cookies):
+        domain = "." + urllib.parse.urlsplit(base_url).netloc
+        set_cookie(client.cookie_jar, domain, "cf_clearance", cf_clearance)
+        eprint("[capsolver] applied cf_clearance cookie")
+
+    token = extract_solution_token(solution)
+    return token, cf_clearance
+
+
+def solve_with_capsolver(
+    capsolver_key: str,
+    task: Dict[str, object],
+    timeout: int,
+    poll_interval: int,
+    poll_timeout: int,
+) -> Dict[str, object]:
+    eprint(f"[capsolver] createTask type={task.get('type')}")
+    task_id = capsolver_create_task(capsolver_key, task, timeout=timeout)
+    eprint(f"[capsolver] taskId={task_id}, polling...")
+    result = capsolver_wait_for_result(
+        capsolver_key, task_id, timeout=timeout, poll_interval=poll_interval, poll_timeout=poll_timeout
+    )
+    solution = result.get("solution")
+    if not isinstance(solution, dict):
+        raise RuntimeError(f"CapSolver result missing solution: {result}")
+    return solution
+
+
+def dump_capsolver_solution(dump_dir: Optional[str], solution: Dict[str, object]) -> None:
+    if not dump_dir:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, "capsolver_solution.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(solution, handle, ensure_ascii=True, indent=2)
+
+
+def dump_response(
+    dump_dir: Optional[str], name: str, status: int, headers: Dict[str, str], body: bytes
+) -> None:
+    if not dump_dir:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, f"{name}.txt")
+    with open(path, "wb") as handle:
+        handle.write(f"STATUS {status}\n".encode("utf-8"))
+        for key, value in headers.items():
+            handle.write(f"{key}: {value}\n".encode("utf-8"))
+        handle.write(b"\n")
+        handle.write(body)
+
+
+def build_payload(
+    email: str,
+    password: Optional[str],
+    name: Optional[str],
+    invite_code: Optional[str],
+    captcha_token: Optional[str],
+    captcha_fields: List[str],
+) -> Dict[str, object]:
+    payload: Dict[str, object] = {"email": email}
+    if password:
+        payload["password"] = password
+    if name:
+        payload["name"] = name
+    if invite_code:
+        payload["inviteCode"] = invite_code
+    if captcha_token and captcha_fields:
+        for field in captcha_fields:
+            field = field.strip()
+            if field:
+                payload[field] = captcha_token
+    return payload
+
+
+def build_context_fields(page_url: str) -> Dict[str, str]:
+    parts = urllib.parse.urlsplit(page_url)
+    query = urllib.parse.parse_qs(parts.query)
+    context_fields: Dict[str, str] = {}
+    for key in ("client_id", "redirect_uri", "state", "authorization_session_id"):
+        values = query.get(key)
+        if values:
+            context_fields[key] = values[0]
+    return context_fields
+
+
+def detect_page_stage(html: str) -> Optional[str]:
+    match = re.search(r'data-hak-page="([^"]+)"', html)
+    if match:
+        return match.group(1)
+    match = re.search(r"<title>([^<]+)</title>", html, re.I)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def looks_like_success(status: int, body_text: str) -> bool:
+    if status in (200, 201, 202, 204):
+        if re.search(r"(code|verification|verify|email).*(sent|send)", body_text, re.I):
+            return True
+        return True
+    return False
+
+
+def fetch_turnstile_sitekey_from_challenge(
+    client: HttpClient,
+    page_url: str,
+    page_origin: str,
+    html: str,
+    dump_dir: Optional[str],
+) -> Optional[str]:
+    script_path = extract_challenge_script_path(html)
+    if not script_path:
+        return None
+    script_url = urllib.parse.urljoin(page_origin, script_path)
+    eprint(f"[flow] fetching challenge script: {script_url}")
+    status, headers, body = client.get(
+        script_url,
+        headers={"Accept": "*/*", "Referer": page_url},
+    )
+    dump_response(dump_dir, "cf_challenge_script", status, headers, body)
+    if status >= 400:
+        return None
+    script_text = decode_body(body, headers)
+    return extract_turnstile_sitekey(script_text)
+
+
+def fetch_js_endpoints(
+    client: HttpClient,
+    page_url: str,
+    page_origin: str,
+    html: str,
+    limit: int,
+    dump_js: bool,
+    dump_dir: Optional[str],
+) -> List[str]:
+    paths = extract_js_chunk_paths(html)
+    if not paths:
+        return []
+    prioritized = [path for path in paths if "sign-up" in path]
+    prioritized.extend([path for path in paths if "sign-up" not in path])
+    paths = list(dict.fromkeys(prioritized))
+    endpoints: List[str] = []
+    for path in paths[:limit]:
+        url = urllib.parse.urljoin(page_origin, path)
+        status, headers, body = client.get(url, headers={"Accept": "*/*", "Referer": page_url})
+        if status >= 400:
+            continue
+        js_text = decode_body(body, headers)
+        if dump_js and dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", path.strip("/"))
+            with open(os.path.join(dump_dir, f"js_{safe_name}"), "w", encoding="utf-8") as handle:
+                handle.write(js_text)
+            if "sign-up" in path or "page-" in path:
+                map_url = url + ".map"
+                map_status, map_headers, map_body = client.get(
+                    map_url, headers={"Accept": "*/*", "Referer": page_url}
+                )
+                if map_status < 400:
+                    map_text = decode_body(map_body, map_headers)
+                    with open(
+                        os.path.join(dump_dir, f"js_{safe_name}.map"), "w", encoding="utf-8"
+                    ) as handle:
+                        handle.write(map_text)
+        endpoints.extend(extract_js_endpoints(js_text))
+    return list(dict.fromkeys(endpoints))
+
+
+def try_nextauth_email(
+    client: HttpClient,
+    base_url: str,
+    email: str,
+    referer: str,
+    dump_dir: Optional[str],
+) -> bool:
+    csrf_url = urllib.parse.urljoin(base_url, "/api/auth/csrf")
+    status, headers, body = client.get(csrf_url, headers={"Accept": "application/json"})
+    dump_response(dump_dir, "nextauth_csrf", status, headers, body)
+    body_text = decode_body(body, headers)
+    csrf_token = None
+    try:
+        data = json.loads(body_text)
+        csrf_token = data.get("csrfToken")
+    except json.JSONDecodeError:
+        match = re.search(r'name="csrfToken"\s+value="([^"]+)"', body_text)
+        if match:
+            csrf_token = match.group(1)
+
+    if not csrf_token:
+        eprint("[nextauth] csrfToken not found")
+        return False
+
+    signin_url = urllib.parse.urljoin(base_url, "/api/auth/signin/email")
+    form = {
+        "csrfToken": csrf_token,
+        "email": email,
+        "callbackUrl": base_url,
+        "json": "true",
+    }
+    data = urllib.parse.urlencode(form).encode("utf-8")
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": base_url,
+        "Referer": referer,
+    }
+    status, headers, body = client.post(signin_url, headers=headers, data=data)
+    dump_response(dump_dir, "nextauth_signin_email", status, headers, body)
+    body_text = decode_body(body, headers)
+    eprint(f"[nextauth] status={status}")
+    return looks_like_success(status, body_text)
+
+
+def attempt_signup_requests(
+    client: HttpClient,
+    base_url: str,
+    endpoints: List[str],
+    email: str,
+    password: Optional[str],
+    name: Optional[str],
+    invite_code: Optional[str],
+    captcha_token: Optional[str],
+    captcha_fields: List[str],
+    context_fields: Dict[str, str],
+    referer: str,
+    dump_dir: Optional[str],
+) -> Tuple[bool, bool]:
+    payload = build_payload(email, password, name, invite_code, captcha_token, captcha_fields)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": base_url,
+        "Referer": referer,
+    }
+    all_404 = True
+
+    for endpoint in endpoints:
+        if endpoint.endswith("/api/auth/signin/email"):
+            continue
+        is_user_mgmt = "/user_management/" in endpoint
+        if is_user_mgmt and context_fields:
+            payload_to_send = {**payload, **context_fields}
+        else:
+            payload_to_send = payload
+        data = json.dumps(payload_to_send).encode("utf-8")
+        status, resp_headers, body = client.post(endpoint, headers=headers, data=data)
+        dump_response(dump_dir, f"signup_{endpoint.rsplit('/', 1)[-1]}", status, resp_headers, body)
+        body_text = decode_body(body, resp_headers)
+        eprint(f"[signup] {endpoint} status={status}")
+        if status != 404:
+            all_404 = False
+        if looks_like_success(status, body_text):
+            eprint("[signup] success signal detected")
+            return True, all_404
+        if is_user_mgmt:
+            form_data = urllib.parse.urlencode(payload_to_send).encode("utf-8")
+            form_headers = dict(headers)
+            form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            status, resp_headers, body = client.post(endpoint, headers=form_headers, data=form_data)
+            dump_response(
+                dump_dir, f"signup_{endpoint.rsplit('/', 1)[-1]}_form", status, resp_headers, body
+            )
+            body_text = decode_body(body, resp_headers)
+            eprint(f"[signup-form] {endpoint} status={status}")
+            if status != 404:
+                all_404 = False
+            if looks_like_success(status, body_text):
+                eprint("[signup-form] success signal detected")
+                return True, all_404
+    return False, all_404
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Cursor AI email code trigger (HTTP only).")
+    parser.add_argument("--email", required=True, help="Test email to register.")
+    parser.add_argument("--password", help="Optional password if required by API.")
+    parser.add_argument("--name", help="Optional name if required by API.")
+    parser.add_argument("--invite-code", help="Optional invite code.")
+    parser.add_argument("--base-url", default="https://authenticator.cursor.sh")
+    parser.add_argument("--signup-path", default="/sign-up")
+    parser.add_argument("--user-agent", default=DEFAULT_UA)
+    parser.add_argument("--proxy", help="Optional proxy like http://user:pass@host:port")
+    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--poll-interval", type=int, default=5)
+    parser.add_argument("--poll-timeout", type=int, default=180)
+    parser.add_argument("--capsolver-key", default=os.getenv("CAPSOLVER_API_KEY"))
+    parser.add_argument("--capsolver-task-type", help="Override CapSolver task type.")
+    parser.add_argument("--capsolver-task-json", help="Raw CapSolver task JSON.")
+    parser.add_argument(
+        "--capsolver-proxy-fields",
+        action="store_true",
+        help="Send proxy fields instead of proxy string to CapSolver.",
+    )
+    parser.add_argument(
+        "--captcha-fields",
+        default="turnstileToken,captchaToken,cfTurnstileResponse",
+        help="Comma-separated fields for captcha token in signup payload.",
+    )
+    parser.add_argument("--endpoints", help="Comma-separated API endpoints to try.")
+    parser.add_argument("--dump-dir", help="Write response dumps to this directory.")
+    parser.add_argument(
+        "--dump-js",
+        action="store_true",
+        help="Dump fetched JS chunks to dump dir.",
+    )
+    parser.add_argument("--js-chunk-limit", type=int, default=6)
+    parser.add_argument(
+        "--dump-capsolver-solution",
+        action="store_true",
+        help="Write CapSolver solution JSON to dump dir.",
+    )
+    args = parser.parse_args()
+
+    client = HttpClient(args.user_agent, args.proxy, args.timeout)
+    signup_url = urllib.parse.urljoin(args.base_url, args.signup_path)
+    eprint(f"[flow] HEAD {signup_url}")
+    head_status, head_headers, _ = client.head(
+        signup_url, headers={"Accept": "text/html,*/*"}, allow_redirects=False
+    )
+    dump_response(args.dump_dir, "signup_head", head_status, head_headers, b"")
+    page_url = signup_url
+    redirect_location = head_headers.get("Location")
+    if head_status in (301, 302, 303, 307, 308) and redirect_location:
+        page_url = urllib.parse.urljoin(signup_url, redirect_location)
+        eprint(f"[flow] redirect detected: {page_url}")
+
+    eprint(f"[flow] GET {page_url}")
+    status, headers, body = client.get(page_url)
+    dump_response(args.dump_dir, "signup_page_initial", status, headers, body)
+    body_text = decode_body(body, headers)
+    page_origin = get_origin(page_url)
+    if page_url != signup_url:
+        eprint(f"[flow] landing page: {page_url}")
+    stage = detect_page_stage(body_text)
+    if stage:
+        eprint(f"[flow] page stage: {stage}")
+
+    if is_cf_challenge(status, headers, body_text):
+        if not args.capsolver_key:
+            eprint("Cloudflare challenge detected but CAPSOLVER_API_KEY is missing.")
+            return 2
+        eprint("[flow] Cloudflare challenge detected")
+        sitekey = extract_turnstile_sitekey(body_text)
+        if not sitekey:
+            sitekey = fetch_turnstile_sitekey_from_challenge(
+                client=client,
+                page_url=page_url,
+                page_origin=page_origin,
+                html=body_text,
+                dump_dir=args.dump_dir,
+            )
+            if sitekey:
+                eprint(f"[flow] sitekey extracted from challenge: {sitekey}")
+        task_type_override = args.capsolver_task_type
+        if not sitekey and not task_type_override and not args.capsolver_task_json:
+            if args.proxy:
+                task_type_override = "AntiCloudflareTask"
+                eprint("[flow] proxy detected, using AntiCloudflareTask")
+            else:
+                eprint(
+                    "Cloudflare challenge did not expose a Turnstile sitekey. "
+                    "Provide --capsolver-task-type/--capsolver-task-json or "
+                    "use --proxy for AntiCloudflareTask."
+                )
+                return 5
+        task = build_capsolver_task(
+            url=page_url,
+            user_agent=client.user_agent,
+            proxy=args.proxy,
+            proxy_fields=args.capsolver_proxy_fields,
+            html=body_text,
+            sitekey=sitekey,
+            task_type=task_type_override,
+            task_json=args.capsolver_task_json,
+        )
+        solution = solve_with_capsolver(
+            args.capsolver_key,
+            task,
+            timeout=args.timeout,
+            poll_interval=args.poll_interval,
+            poll_timeout=args.poll_timeout,
+        )
+        if args.dump_capsolver_solution:
+            dump_capsolver_solution(args.dump_dir, solution)
+        apply_capsolver_solution(client, page_origin, solution)
+        eprint(f"[flow] retry GET {page_url}")
+        status, headers, body = client.get(page_url)
+        dump_response(args.dump_dir, "signup_page_after_cf", status, headers, body)
+        body_text = decode_body(body, headers)
+        page_url = client.last_url or page_url
+        page_origin = get_origin(page_url)
+        if is_cf_challenge(status, headers, body_text):
+            eprint("Cloudflare challenge still present after CapSolver.")
+            return 3
+        stage = detect_page_stage(body_text)
+        if stage:
+            eprint(f"[flow] page stage: {stage}")
+
+    turnstile_sitekey = extract_turnstile_sitekey(body_text)
+    captcha_token = None
+    if turnstile_sitekey:
+        if not args.capsolver_key:
+            eprint("Turnstile detected but CAPSOLVER_API_KEY is missing.")
+            return 4
+        eprint(f"[flow] Turnstile sitekey detected: {turnstile_sitekey}")
+        task = build_capsolver_task(
+            url=page_url,
+            user_agent=client.user_agent,
+            proxy=args.proxy,
+            proxy_fields=args.capsolver_proxy_fields,
+            html=None,
+            sitekey=turnstile_sitekey,
+            task_type=args.capsolver_task_type,
+            task_json=args.capsolver_task_json,
+        )
+        solution = solve_with_capsolver(
+            args.capsolver_key,
+            task,
+            timeout=args.timeout,
+            poll_interval=args.poll_interval,
+            poll_timeout=args.poll_timeout,
+        )
+        if args.dump_capsolver_solution:
+            dump_capsolver_solution(args.dump_dir, solution)
+        captcha_token, _ = apply_capsolver_solution(client, page_origin, solution)
+        if not captcha_token:
+            eprint("Turnstile solved but no token found in solution.")
+
+    endpoints: List[str]
+    if args.endpoints:
+        endpoints = [item.strip() for item in args.endpoints.split(",") if item.strip()]
+    else:
+        extracted = extract_api_candidates(body_text)
+        if extracted:
+            endpoints = extracted
+        else:
+            endpoints = DEFAULT_ENDPOINTS + USER_MANAGEMENT_ENDPOINTS
+    api_origin = page_origin
+    js_endpoints = fetch_js_endpoints(
+        client=client,
+        page_url=page_url,
+        page_origin=page_origin,
+        html=body_text,
+        limit=args.js_chunk_limit,
+        dump_js=args.dump_js,
+        dump_dir=args.dump_dir,
+    )
+    if js_endpoints:
+        eprint(f"[flow] extracted {len(js_endpoints)} endpoints from JS")
+        endpoints = list(dict.fromkeys(js_endpoints + endpoints))
+    endpoints = normalize_endpoints(api_origin, rank_endpoints(endpoints))
+
+    captcha_fields = [item.strip() for item in args.captcha_fields.split(",") if item.strip()]
+    referer = page_url
+    nextauth_origin = extract_redirect_origin(page_url) or page_origin
+    context_fields = build_context_fields(page_url)
+    if nextauth_origin != page_origin:
+        eprint(f"[flow] next-auth origin: {nextauth_origin}")
+
+    eprint(f"[flow] trying {len(endpoints)} endpoints")
+    success, all_404 = attempt_signup_requests(
+        client=client,
+        base_url=api_origin,
+        endpoints=endpoints,
+        email=args.email,
+        password=args.password,
+        name=args.name,
+        invite_code=args.invite_code,
+        captcha_token=captcha_token,
+        captcha_fields=captcha_fields,
+        context_fields=context_fields,
+        referer=referer,
+        dump_dir=args.dump_dir,
+    )
+
+    if not success and all_404:
+        alt_origin = None
+        if api_origin.endswith("authenticator.cursor.sh"):
+            alt_origin = "https://authenticate.cursor.sh"
+        elif api_origin.endswith("authenticate.cursor.sh"):
+            alt_origin = "https://authenticator.cursor.sh"
+        if alt_origin:
+            eprint(f"[flow] retrying endpoints on {alt_origin}")
+            alt_endpoints: List[str] = []
+            for endpoint in endpoints:
+                if endpoint.startswith("http"):
+                    parts = urllib.parse.urlsplit(endpoint)
+                    if parts.netloc == urllib.parse.urlsplit(api_origin).netloc:
+                        swapped = urllib.parse.urlsplit(alt_origin)
+                        alt_url = urllib.parse.urlunsplit(
+                            (swapped.scheme, swapped.netloc, parts.path, parts.query, parts.fragment)
+                        )
+                        alt_endpoints.append(alt_url)
+                    else:
+                        alt_endpoints.append(endpoint)
+                else:
+                    alt_endpoints.append(urllib.parse.urljoin(alt_origin, endpoint))
+            success, _ = attempt_signup_requests(
+                client=client,
+                base_url=alt_origin,
+                endpoints=alt_endpoints,
+                email=args.email,
+                password=args.password,
+                name=args.name,
+                invite_code=args.invite_code,
+                captcha_token=captcha_token,
+                captcha_fields=captcha_fields,
+                context_fields=context_fields,
+                referer=referer,
+                dump_dir=args.dump_dir,
+            )
+
+    if not success:
+        eprint("[flow] fallback to next-auth email attempt")
+        success = try_nextauth_email(
+            client=client,
+            base_url=nextauth_origin,
+            email=args.email,
+            referer=referer,
+            dump_dir=args.dump_dir,
+        )
+
+    if success:
+        eprint("[flow] completed. Check inbox for verification code.")
+        return 0
+
+    eprint("[flow] no success response detected. Check dumps/logs.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
